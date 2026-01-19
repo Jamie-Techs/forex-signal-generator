@@ -196,14 +196,36 @@ def run_apex_pro(symbol, index):
 def home():
     return jsonify({"status": "Active", "engine": "APEX-PRO-v2026", "guards": "MTFA + Drawdown"}), 200
 
+
 @app.route("/run")
 def trigger_cycle():
     now_hour = datetime.now(timezone.utc).hour
-    if 21 <= now_hour <= 23: return jsonify({"status": "Paused (Rollover)"})
+    # Check for rollover pause
+    if 21 <= now_hour <= 23: 
+        return jsonify({"status": "Paused (Rollover)"})
 
-    threads = [threading.Thread(target=run_apex_pro, args=(s, i)) for i, s in enumerate(SYMBOLS)]
-    for t in threads: t.start()
-    return jsonify({"status": "Cycle Launched", "time": str(datetime.now())})
+    # NEW: Run sequentially to avoid 429 Rate Limits
+    def background_task():
+        for i, symbol in enumerate(SYMBOLS):
+            try:
+                # Stagger each symbol by 15 seconds to let OpenAI/Oanda breathe
+                run_apex_pro(symbol, i)
+                time.sleep(15) 
+            except Exception as e:
+                logging.error(f"Error in background task for {symbol}: {e}")
+
+    # Start the sequence in one single background thread so the URL responds immediately
+    task_thread = threading.Thread(target=background_task)
+    task_thread.start()
+
+    return jsonify({
+        "status": "Sequential Cycle Launched", 
+        "symbols": SYMBOLS,
+        "spacing": "15s Delay Per Symbol"
+    })
+
+
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
