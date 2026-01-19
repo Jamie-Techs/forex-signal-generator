@@ -196,86 +196,14 @@ def run_apex_pro(symbol, index):
 def home():
     return jsonify({"status": "Active", "engine": "APEX-PRO-v2026", "guards": "MTFA + Drawdown"}), 200
 
-
-
-# ================== UPDATED ENGINE ==================
-
-def background_trading_sequence():
-    """Processes symbols one-by-one to prevent OpenAI 429 errors."""
-    if not is_market_open():
-        logging.info("Market Closed. Sequence aborted.")
-        return
-
-    # 1. Global Risk Check (Run once per cycle)
-    if not drawdown_guard_passed():
-        return
-
-    for i, symbol in enumerate(SYMBOLS):
-        try:
-            logging.info(f"--- Processing {symbol} ({i+1}/{len(SYMBOLS)}) ---")
-            
-            # Staggered start within the loop to satisfy OpenAI/AlphaVantage
-            # Total spacing = 15s + whatever time the logic takes
-            time.sleep(15) 
-            
-            with PORTFOLIO_LOCK:
-                # Get Trend and Sentiment
-                htf_trend = get_h1_trend(symbol)
-                sentiment = get_macro_sentiment(symbol)
-                
-                if "DANGER" in sentiment:
-                    logging.warning(f"⚠️ News Guard: {symbol} skipped (DANGER).")
-                    continue
-
-                # Fetch M15 Data
-                r = instruments.InstrumentsCandles(symbol, {"granularity": "M15", "count": 200})
-                client.request(r)
-                df = pd.DataFrame([{"close": float(c["mid"]["c"]), "open": float(c["mid"]["o"]), 
-                                    "high": float(c["mid"]["h"]), "low": float(c["mid"]["l"])} for c in r.response["candles"]])
-                
-                # Analysis & Optimization
-                params = get_optimized_params(df)
-                rsi = ta.momentum.rsi(df['close'], 14).iloc[-1]
-                atr = ta.volatility.average_true_range(df['high'], df['low'], df['close']).iloc[-1]
-                is_bullish_pat = df.iloc[-1]['close'] > df.iloc[-2]['open']
-                
-                # Signal Logic
-                signal = "NEUTRAL"
-                if rsi < params['rsi_l'] and is_bullish_pat and htf_trend == "UP": signal = "BUY"
-                if rsi > params['rsi_h'] and not is_bullish_pat and htf_trend == "DOWN": signal = "SELL"
-                
-                # Execution
-                if signal != "NEUTRAL":
-                    ai_score = float(sentiment) if any(char.isdigit() for char in sentiment) else 0
-                    if (signal == "BUY" and ai_score >= -0.1) or (signal == "SELL" and ai_score <= 0.1):
-                        acc_r = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(acc_r)
-                        execute_pro_trade(symbol, signal, df.iloc[-1]['close'], atr, float(acc_r.response["account"]["NAV"]))
-                    else:
-                        logging.info(f"Signal {signal} for {symbol} blocked by AI Sentiment ({ai_score})")
-
-        except Exception as e:
-            logging.error(f"Error processing {symbol}: {e}")
-
 @app.route("/run")
 def trigger_cycle():
-    """Launches the sequence in a single background thread."""
     now_hour = datetime.now(timezone.utc).hour
     if 21 <= now_hour <= 23: return jsonify({"status": "Paused (Rollover)"})
 
-    # Start the sequential loop in one background thread
-    threading.Thread(target=background_trading_sequence, daemon=True).start()
-    
-    return jsonify({
-        "status": "Sequential Engine Started", 
-        "mode": "Anti-429 Safe Mode",
-        "time": str(datetime.now())
-    })
-
-
-
-
-
-
+    threads = [threading.Thread(target=run_apex_pro, args=(s, i)) for i, s in enumerate(SYMBOLS)]
+    for t in threads: t.start()
+    return jsonify({"status": "Cycle Launched", "time": str(datetime.now())})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
